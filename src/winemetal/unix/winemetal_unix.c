@@ -1,5 +1,6 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
+#include <sys/mman.h>
 #import <Cocoa/Cocoa.h>
 #import <ColorSync/ColorSync.h>
 #import <CoreFoundation/CFRunLoop.h>
@@ -159,6 +160,18 @@ _MTLDevice_newBuffer(void *obj) {
   struct WMTBufferInfo *info = params->info.ptr;
   id<MTLBuffer> buffer;
   if (info->memory.ptr) {
+    /* Drop host EXECUTE permission on the wrapped CPU memory. For 32-bit games with DEP off, Wine maps all
+     * data rwx; Rosetta then treats a hot page of our argument buffers as code and traps every write into its
+     * exception server (~100k faults/s in GTA SA outdoors, multi-second stalls). The whole 16 KB host pages
+     * touching the range are changed: d3d9 allocates all wrapped memory from dedicated VirtualAlloc regions
+     * (big blocks and a small-buffer arena), so those pages hold only our buffers. */
+    {
+      const uintptr_t host_page = 16384;
+      uintptr_t start = (uintptr_t)info->memory.ptr & ~(host_page - 1);
+      uintptr_t end = ((uintptr_t)info->memory.ptr + info->length + host_page - 1) & ~(host_page - 1);
+      if (end > start)
+        mprotect((void *)start, end - start, PROT_READ | PROT_WRITE);
+    }
     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
                                        length:info->length
                                       options:(enum MTLResourceOptions)info->options
@@ -1507,6 +1520,11 @@ _MetalLayer_setProps(void *obj) {
   CAMetalLayer *layer = (CAMetalLayer *)params->handle;
   const struct WMTLayerProps *props = params->arg.ptr;
   execute_on_main(^{
+    // The drawable is scaled to the window's pixel size by Core Animation (2x on Retina when the game runs at
+    // Wine's point resolution). Wine's view layer uses nearest-neighbour magnification; use linear filtering
+    // like the OpenGL path does, otherwise every edge shows hard 2x2 steps.
+    layer.magnificationFilter = kCAFilterLinear;
+    layer.minificationFilter = kCAFilterLinear;
     layer.device = (id<MTLDevice>)props->device;
     layer.opaque = props->opaque;
     layer.framebufferOnly = props->framebuffer_only;

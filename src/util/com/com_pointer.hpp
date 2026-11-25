@@ -71,9 +71,13 @@ public:
   Com(Com &&other) : m_ptr(other.m_ptr) { other.m_ptr = nullptr; }
 
   Com &operator=(T *object) {
+    // Take the new reference before dropping the old one: on self-assignment
+    // (e.g. SetDepthStencilSurface with the surface we already hold as the only
+    // reference) releasing first would free the object and then AddRef freed memory.
+    if (object != nullptr)
+      ComRef::incRef(object);
     this->decRef();
     m_ptr = object;
-    this->incRef();
     return *this;
   }
 

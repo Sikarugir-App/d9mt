@@ -1,5 +1,7 @@
 
 #include "d3d9_interface.hpp"
+#include <algorithm>
+#include <vector>
 #include "d3d9_device.hpp"
 #include "d3d9_format.hpp"
 #include "log/log.hpp"
@@ -80,26 +82,36 @@ static UINT enumerateMatchingModes(D3DFORMAT Format, UINT targetIndex, D3DDISPLA
 
   HMONITOR monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
   wsi::WsiMode wsiMode;
-  UINT matchCount = 0;
+  std::vector<D3DDISPLAYMODE> modes;
 
   for (uint32_t i = 0; wsi::getDisplayMode(monitor, i, &wsiMode); i++) {
     if (wsiMode.bitsPerPixel != bpp)
       continue;
-
-    if (pOut && matchCount == targetIndex) {
-      pOut->Width = wsiMode.width;
-      pOut->Height = wsiMode.height;
-      pOut->RefreshRate = (wsiMode.refreshRate.denominator != 0)
-          ? wsiMode.refreshRate.numerator / wsiMode.refreshRate.denominator
-          : 60;
-      pOut->Format = Format;
-      return matchCount + 1;
-    }
-
-    matchCount++;
+    D3DDISPLAYMODE m = {};
+    m.Width = wsiMode.width;
+    m.Height = wsiMode.height;
+    m.RefreshRate = (wsiMode.refreshRate.denominator != 0)
+        ? wsiMode.refreshRate.numerator / wsiMode.refreshRate.denominator
+        : 60;
+    m.Format = Format;
+    bool dup = false;
+    for (auto &e : modes)
+      dup |= e.Width == m.Width && e.Height == m.Height && e.RefreshRate == m.RefreshRate;
+    if (!dup)
+      modes.push_back(m);
   }
 
-  return matchCount;
+  // Same order as wined3d (width, height, refresh rate), so games that store a
+  // mode *index* (e.g. GTA SA's gta_sa.set) pick the same resolution as before.
+  std::sort(modes.begin(), modes.end(), [](const D3DDISPLAYMODE &a, const D3DDISPLAYMODE &b) {
+    if (a.Width != b.Width) return a.Width < b.Width;
+    if (a.Height != b.Height) return a.Height < b.Height;
+    return a.RefreshRate < b.RefreshRate;
+  });
+
+  if (pOut && targetIndex < modes.size())
+    *pOut = modes[targetIndex];
+  return (UINT)modes.size();
 }
 
 UINT STDMETHODCALLTYPE D3D9Interface::GetAdapterModeCount(UINT Adapter, D3DFORMAT Format) {

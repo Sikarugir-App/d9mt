@@ -46,6 +46,8 @@ compiler_args = [
   '-Wno-missing-field-initializers',
   '-Wno-unused-parameter',
   '-Wno-cast-function-type', # Needed for GetProcAddress.
+  '-Wno-class-memaccess', # DXBCParser memcpy/memset on non-trivial classes (newer GCC)
+  '-Wno-maybe-uninitialized', # GCC false positives at -O3 (out-params filled by D3D calls)
   # clang
   '-Wno-unused-private-field',
   '-Wno-microsoft-exception-spec',

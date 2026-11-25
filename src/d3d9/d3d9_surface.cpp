@@ -64,9 +64,9 @@ HRESULT STDMETHODCALLTYPE D3D9Surface::GetDesc(D3DSURFACE_DESC *pDesc) {
     pDesc->Width = width_;
     pDesc->Height = height_;
   } else {
-    pDesc->Format = D3DFMT_X8R8G8B8;
+    pDesc->Format = format_;
     pDesc->Type = D3DRTYPE_SURFACE;
-    pDesc->Usage = D3DUSAGE_RENDERTARGET;
+    pDesc->Usage = gpu_usage_;
     pDesc->Pool = D3DPOOL_DEFAULT;
     pDesc->MultiSampleType = D3DMULTISAMPLE_NONE;
     pDesc->MultiSampleQuality = 0;

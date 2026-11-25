@@ -5,6 +5,7 @@
 #include "thread.hpp"
 #include "util_math.hpp"
 #include "wsi_platform.hpp"
+#include "dxmt_placed_pool.hpp"
 #include <mutex>
 #include <queue>
 
@@ -96,10 +97,13 @@ public:
     uint64_t gpu_address;
     void *mapped_address;
     bool owns_mapped_address = false;
+    size_t size = 0;
+    WMTResourceOptions options{};
 
     ~Block() {
       if (mapped_address && owns_mapped_address) {
-        wsi::aligned_free(mapped_address);
+        // keep memory + MTLBuffer for reuse (see dxmt_placed_pool.hpp)
+        placed_pool::release({mapped_address, size, options, std::move(buffer), gpu_address});
         mapped_address = nullptr;
       }
     };
@@ -112,6 +116,8 @@ public:
       gpu_address = move.gpu_address;
       mapped_address = move.mapped_address;
       owns_mapped_address = move.owns_mapped_address;
+      size = move.size;
+      options = move.options;
       move.mapped_address = nullptr;
       move.owns_mapped_address = false;
     };
@@ -121,8 +127,17 @@ public:
   allocate(size_t block_size) {
     Block block{};
     if (placed_buffer_) {
-      block.mapped_address = wsi::aligned_malloc(block_size, DXMT_PAGE_SIZE);
       block.owns_mapped_address = true;
+      block.size = block_size;
+      block.options = buffer_info_;
+      placed_pool::Entry pooled;
+      if (placed_pool::acquire(block_size, buffer_info_, pooled)) {
+        block.mapped_address = pooled.memory;
+        block.buffer = std::move(pooled.buffer);
+        block.gpu_address = pooled.gpu_address;
+        return block;
+      }
+      block.mapped_address = wsi::aligned_malloc(block_size, DXMT_PAGE_SIZE);
     }
     WMTBufferInfo info;
     info.options = buffer_info_;

@@ -98,9 +98,15 @@ public:
     pLockedRect->Pitch = mip.pitch;
     if (pRect) {
       // Return pointer to the sub-rect origin within the mip buffer
-      UINT bytesPerPixel = mip.pitch / mip.width;
-      pLockedRect->pBits = static_cast<uint8_t *>(mip.data)
-        + pRect->top * mip.pitch + pRect->left * bytesPerPixel;
+      if (IsCompressedFormat(format_)) {
+        // pitch is per row of 4x4 blocks
+        pLockedRect->pBits = static_cast<uint8_t *>(mip.data)
+          + (pRect->top / 4) * mip.pitch + (pRect->left / 4) * D3D9FormatBlockSize(format_);
+      } else {
+        UINT bytesPerPixel = D3D9FormatBytesPerPixel(format_);
+        pLockedRect->pBits = static_cast<uint8_t *>(mip.data)
+          + pRect->top * mip.pitch + pRect->left * bytesPerPixel;
+      }
     } else {
       pLockedRect->pBits = mip.data;
     }
