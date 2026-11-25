@@ -1,3 +1,5 @@
+#include "dxmt_placed_pool.hpp"
+#include <cstring>
 #include "dxmt_buffer.hpp"
 #include "dxmt_format.hpp"
 #include "thread.hpp"
@@ -22,11 +24,26 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     suballocation_count_ = DXMT_PAGE_SIZE / suballocation_size_;
     info_.length = DXMT_PAGE_SIZE;
   }
+  bool from_pool = false;
   if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
-    placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
+    // Round up and add a spare page: D3D9 games (e.g. RenderWare/GTA SA) may write slightly past
+    // a vertex buffer's end, which real drivers tolerate; without slack this corrupts the CRT heap.
+    size_t placed_size = ((info_.length + DXMT_PAGE_SIZE - 1) / DXMT_PAGE_SIZE + 1) * DXMT_PAGE_SIZE;
+    // Reuse a pooled (memory, MTLBuffer) pair: freeing Metal-wrapped memory and reusing it stalls for seconds.
+    placed_pool::Entry pooled;
+    if (placed_pool::acquire(info_.length, info_.options, pooled)) {
+      placed_buffer = pooled.memory;
+      obj_ = std::move(pooled.buffer);
+      info_.gpu_address = pooled.gpu_address;
+      from_pool = true;
+    } else {
+      placed_buffer = wsi::aligned_malloc(placed_size, DXMT_PAGE_SIZE);
+    }
+    std::memset(placed_buffer, 0, placed_size);
     info_.memory.set(placed_buffer);
   }
-  obj_ = device.newBuffer(info_);
+  if (!from_pool)
+    obj_ = device.newBuffer(info_);
   gpuAddress_ = info_.gpu_address;
   mappedMemory_ = info_.memory.get_accessible_or_null();
   depkey = EncoderDepSet::generateNewKey(global_buffer_seq.fetch_add(1));
@@ -34,7 +51,8 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
 
 BufferAllocation::~BufferAllocation() {
   if (placed_buffer) {
-    wsi::aligned_free(placed_buffer);
+    // hand memory + MTLBuffer back to the pool instead of freeing (see dxmt_placed_pool.hpp)
+    placed_pool::release({placed_buffer, (size_t)info_.length, info_.options, std::move(obj_), gpuAddress_});
     placed_buffer = nullptr;
   }
 }

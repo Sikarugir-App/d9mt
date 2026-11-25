@@ -81,28 +81,48 @@ public:
     this->handle = retained;
   }
 
+  // Retain the new object BEFORE releasing the old one: assigning the object a Reference already holds
+  // (e.g. re-binding the same depth texture / PSO) must not drop it to zero and free it first.
   Reference &
   operator=(const Reference &copy) {
-    if (this->handle != NULL_OBJECT_HANDLE)
-      this->release();
-    this->handle = copy.handle;
-    this->retain();
+    obj_handle_t old = this->handle;
+    Class incoming;
+    incoming.handle = copy.handle;
+    if (incoming.handle != NULL_OBJECT_HANDLE)
+      incoming.retain();
+    this->handle = incoming.handle;
+    if (old != NULL_OBJECT_HANDLE) {
+      Class prev;
+      prev.handle = old;
+      prev.release();
+    }
     return *this;
   }
   Reference &
   operator=(Class non_retained) {
-    if (this->handle != NULL_OBJECT_HANDLE)
-      this->release();
+    obj_handle_t old = this->handle;
+    if (non_retained.handle != NULL_OBJECT_HANDLE)
+      non_retained.retain();
     this->handle = non_retained.handle;
-    this->retain();
+    if (old != NULL_OBJECT_HANDLE) {
+      Class prev;
+      prev.handle = old;
+      prev.release();
+    }
     return *this;
   }
   Reference &
   operator=(Reference &&move) {
-    if (this->handle != NULL_OBJECT_HANDLE)
-      this->release();
+    if (&move == this)
+      return *this;
+    obj_handle_t old = this->handle;
     this->handle = move.handle;
     move.handle = NULL_OBJECT_HANDLE;
+    if (old != NULL_OBJECT_HANDLE) {
+      Class prev;
+      prev.handle = old;
+      prev.release();
+    }
     return *this;
   }
   Reference &
@@ -757,6 +777,10 @@ public:
 
   Reference<Buffer>
   newBuffer(WMTBufferInfo &info) {
+    // Buffers wrapping our own CPU memory (NoCopy) must not request write-combined CPU cache mode: measured on
+    // Apple Silicon under Rosetta/WoW64, writes to such pages stalled for 1-2 s after GPU use (GTA SA, alt-tab).
+    if (info.memory.ptr)
+      info.options = (WMTResourceOptions)(info.options & ~WMTResourceOptionCPUCacheModeWriteCombined);
     return Reference<Buffer>(MTLDevice_newBuffer(handle, &info));
   }
 
