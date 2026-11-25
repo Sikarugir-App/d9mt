@@ -11,6 +11,8 @@
 #include "dxmt_presenter.hpp"
 #include "dxmt_texture.hpp"
 #include "d3d9_fixed_function.hpp"
+#include "d3d9_buffer.hpp"
+#include "wsi_window.hpp" // full types needed for Com<D3D9VertexBuffer/IndexBuffer> members (GCC)
 #include "log/log.hpp"
 #include <array>
 #include <map>
@@ -267,7 +269,10 @@ public:
     uint32_t stencil_ref;
     obj_handle_t dsso;
     struct TexCapture {
-      Texture *texture; // raw pointer — lifetime ensured by Com<D3D9Texture2D> in bound_textures_[]
+      // Owning reference: the game may unbind and free a texture right after the draw call, before the
+      // encoder thread has used this capture (a raw pointer here caused a use-after-free of the MTLTexture
+      // that crashed Metal's completion thread = freeze on the first gameplay frame in GTA SA).
+      Rc<Texture> texture;
       TextureViewKey viewKey;
       uint32_t stage;
     };
@@ -313,6 +318,10 @@ private:
   Com<IDirect3D9> d3d9_;
   HWND hwnd_;
   D3DPRESENT_PARAMETERS present_params_;
+  // Fullscreen: window restyled/resized to the backbuffer (like wined3d/DXGI do)
+  wsi::DXMTWindowState window_state_ = {};
+  bool fullscreen_window_ = false;
+  void ApplyFullscreenWindow();
 
   std::unique_ptr<Device> dxmt_device_;
   WMT::Object native_view_;
@@ -364,7 +373,7 @@ private:
   D3DMATERIAL9 material_ = {};
 
   // Lights
-  static constexpr DWORD kMaxLights = 8;
+  static constexpr DWORD kMaxLights = 32; // D3D9 allows any light index; only 8 may be active (consumers cap at 8)
   D3DLIGHT9 lights_[kMaxLights] = {};
   BOOL light_enabled_[kMaxLights] = {};
 
@@ -446,9 +455,12 @@ private:
   ShaderConstants *current_const_snapshot_ = nullptr;
   uint64_t snapshot_vs_version_ = ~0ULL;
   uint64_t snapshot_ps_version_ = ~0ULL;
+  uint16_t snapshot_vs_count_ = 0, snapshot_ps_count_ = 0;
 
   // Persistent FF VS constant buffer — only changed sections updated per draw
-  float cached_ff_vs_[100][4] = {};
+  // FF VS constants; layout shared with airconv d3d9_ff_shader.cpp (c[100+i] = light i specular)
+  static constexpr uint32_t kFFVSConstCount = 108;
+  float cached_ff_vs_[kFFVSConstCount][4] = {};
   float cached_ff_ps_[3][4] = {};
   enum FFDirty : uint32_t {
     kFFDirtyWorld      = 1 << 0, // c[0..3], c[12..15], c[16..19]
@@ -525,11 +537,14 @@ private:
   BOOL cursor_visible_ = TRUE;
 
   // Fixed-function shader caches
-  std::map<FFVSKey, WMT::Reference<WMT::Function>> ff_vs_cache_;
+  // Keyed by FFVSKey bytes + vertex layout (elements + stream mask): the generated FF VS hard-codes element
+  // streams/offsets/types, so two layouts with the same FFVSKey must not share a shader.
+  std::map<std::string, WMT::Reference<WMT::Function>> ff_vs_cache_;
   std::map<FFPSKey, WMT::Reference<WMT::Function>> ff_ps_cache_;
 
   FFVSKey BuildFFVSKey();
   FFPSKey BuildFFPSKey();
+  void FillFFVSTexcoordModes(FFVSKey &key);
   WMT::Reference<WMT::Function> GetOrCreateFFVS(const FFVSKey &key, D3D9VertexDeclaration *vdecl);
   WMT::Reference<WMT::Function> GetOrCreateFFPS(const FFPSKey &key);
   void UpdateFFConstants(); // incremental update of cached_ff_vs_/ps_ using ff_dirty_

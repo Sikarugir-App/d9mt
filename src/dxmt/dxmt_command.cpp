@@ -130,16 +130,16 @@ ClearRenderTargetContext::ClearRenderTargetContext(
 }
 
 void
-ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
+ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view, unsigned dsv_clear, uint8_t stencil) {
   assert(!clearing_texture_);
 
   WMT::Reference<WMT::Error> err;
 
   auto format = texture->pixelFormat(view);
   auto dsv_flag = DepthStencilPlanarFlags(format);
-
-  if (dsv_flag & ~1u)
-    return; // stencil clear is not supported
+  dsv_clear &= dsv_flag;
+  if (dsv_flag && !dsv_clear)
+    return;
 
   // enforce array render target for now
   view = texture->checkViewUseArray(view, true);
@@ -151,7 +151,10 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
     pipeline_info.vertex_function = vs_clear_;
     if (dsv_flag) {
       pipeline_info.fragment_function = fs_clear_depth_;
-      pipeline_info.depth_pixel_format = format;
+      if (dsv_flag & 1)
+        pipeline_info.depth_pixel_format = format;
+      if (dsv_flag & 2)
+        pipeline_info.stencil_pixel_format = format;
     } else if (IsIntegerFormat(format)) {
       pipeline_info.colors[0].pixel_format = format;
       if (MTLGetUnsignedIntegerFormat(format) == format) {
@@ -183,11 +186,21 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
   auto &pass_info = *ctx_.startRenderPass(dsv_flag, 0, 1, 0);
 
   if (dsv_flag) {
-    auto &depth = pass_info.depth;
-    depth.attachment = ctx_.access(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-    depth.depth_plane = 0;
-    depth.load_action = WMTLoadActionLoad;
-    depth.store_action = WMTStoreActionStore;
+    auto &attachment = ctx_.access(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+    if (dsv_flag & 1) {
+      auto &depth = pass_info.depth;
+      depth.attachment = attachment;
+      depth.depth_plane = 0;
+      depth.load_action = WMTLoadActionLoad;
+      depth.store_action = WMTStoreActionStore;
+    }
+    if (dsv_flag & 2) {
+      auto &st = pass_info.stencil;
+      st.attachment = attachment;
+      st.depth_plane = 0;
+      st.load_action = WMTLoadActionLoad;
+      st.store_action = WMTStoreActionStore;
+    }
   } else {
     auto &color = pass_info.colors[0];
     color.attachment = ctx_.access(texture, view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
@@ -211,8 +224,29 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
 
   auto &setdsso = ctx_.encodeRenderCommand<wmtcmd_render_setdsso>();
   setdsso.type = WMTRenderCommandSetDSSO;
-  setdsso.dsso = dsv_flag ? depth_write_state_.handle : depth_readonly_state_.handle;
-  setdsso.stencil_ref = 0;
+  if (dsv_flag) {
+    auto &dss = ds_states_[dsv_clear & 3];
+    if (!dss) {
+      WMTDepthStencilInfo ds_info{};
+      ds_info.depth_compare_function = WMTCompareFunctionAlways;
+      ds_info.depth_write_enabled = (dsv_clear & 1) != 0;
+      WMTStencilInfo st{};
+      st.enabled = (dsv_clear & 2) != 0;
+      st.stencil_compare_function = WMTCompareFunctionAlways;
+      st.depth_stencil_pass_op = WMTStencilOperationReplace;
+      st.stencil_fail_op = WMTStencilOperationKeep;
+      st.depth_fail_op = WMTStencilOperationKeep;
+      st.write_mask = 0xFF;
+      st.read_mask = 0xFF;
+      ds_info.front_stencil = st;
+      ds_info.back_stencil = st;
+      dss = device_.newDepthStencilState(ds_info);
+    }
+    setdsso.dsso = dss.handle;
+  } else {
+    setdsso.dsso = depth_readonly_state_.handle;
+  }
+  setdsso.stencil_ref = stencil;
 
   clearing_texture_ = std::move(texture);
   clearing_texture_view_ = view;

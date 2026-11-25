@@ -50,8 +50,8 @@ private:
   D3DVIEWPORT9 viewport = {};
   RECT scissor_rect = {};
   D3DMATERIAL9 material = {};
-  D3DLIGHT9 lights[8] = {};
-  BOOL light_enabled[8] = {};
+  D3DLIGHT9 lights[32] = {};       // must match D3D9Device::kMaxLights
+  BOOL light_enabled[32] = {};
   DWORD fvf = 0;
   float vs_constants[256][4] = {};
   float ps_constants[256][4] = {};

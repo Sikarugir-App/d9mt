@@ -9,6 +9,17 @@
 
 // MTLAttributeFormat values (from Metal headers)
 enum {
+  DxsoAttrFormatUChar4                = 3,
+  DxsoAttrFormatUShort2               = 13,
+  DxsoAttrFormatUShort4               = 15,
+  DxsoAttrFormatShort2                = 16,
+  DxsoAttrFormatShort4                = 18,
+  DxsoAttrFormatUShort2Normalized     = 19,
+  DxsoAttrFormatUShort4Normalized     = 21,
+  DxsoAttrFormatShort2Normalized      = 22,
+  DxsoAttrFormatShort4Normalized      = 24,
+  DxsoAttrFormatHalf2                 = 25,
+  DxsoAttrFormatHalf4                 = 27,
   DxsoAttrFormatUChar4Normalized      = 9,
   DxsoAttrFormatFloat                 = 28,
   DxsoAttrFormatFloat2                = 29,
@@ -300,6 +311,64 @@ static void compileVertexShader(
           case DxsoAttrFormatFloat4: {
             auto *vec_ptr = builder.CreateBitCast(byte_ptr, float4Ty->getPointerTo((uint32_t)AddressSpace::device));
             result = builder.CreateLoad(float4Ty, vec_ptr);
+            break;
+          }
+          case DxsoAttrFormatUChar4:
+          case DxsoAttrFormatUShort2:
+          case DxsoAttrFormatUShort4:
+          case DxsoAttrFormatShort2:
+          case DxsoAttrFormatShort4:
+          case DxsoAttrFormatUShort2Normalized:
+          case DxsoAttrFormatUShort4Normalized:
+          case DxsoAttrFormatShort2Normalized:
+          case DxsoAttrFormatShort4Normalized:
+          case DxsoAttrFormatHalf2:
+          case DxsoAttrFormatHalf4: {
+            // Integer / normalized / half formats: convert per component, missing components = (0,0,0,1)
+            // like D3D9. (Previously these fell into the float4 fallback below: e.g. UBYTE4 blend indices
+            // were read as garbage floats, so skinned peds all used bone 0 = T-pose.)
+            unsigned count = 4;
+            Type *compTy = builder.getInt16Ty();
+            bool isSigned = false, normalize = false, isHalf = false;
+            switch (elem.format) {
+            case DxsoAttrFormatUChar4: compTy = builder.getInt8Ty(); break;
+            case DxsoAttrFormatUShort2: count = 2; break;
+            case DxsoAttrFormatUShort4: break;
+            case DxsoAttrFormatShort2: count = 2; isSigned = true; break;
+            case DxsoAttrFormatShort4: isSigned = true; break;
+            case DxsoAttrFormatUShort2Normalized: count = 2; normalize = true; break;
+            case DxsoAttrFormatUShort4Normalized: normalize = true; break;
+            case DxsoAttrFormatShort2Normalized: count = 2; isSigned = true; normalize = true; break;
+            case DxsoAttrFormatShort4Normalized: isSigned = true; normalize = true; break;
+            case DxsoAttrFormatHalf2: count = 2; isHalf = true; break;
+            case DxsoAttrFormatHalf4: isHalf = true; break;
+            default: break;
+            }
+            auto *comp_ptr = builder.CreateBitCast(byte_ptr, compTy->getPointerTo((uint32_t)AddressSpace::device));
+            result = ConstantVector::get({
+              ConstantFP::get(types._float, 0.0),
+              ConstantFP::get(types._float, 0.0),
+              ConstantFP::get(types._float, 0.0),
+              ConstantFP::get(types._float, 1.0)});
+            for (unsigned c = 0; c < count; c++) {
+              Value *raw = builder.CreateLoad(compTy, builder.CreateConstGEP1_32(compTy, comp_ptr, c));
+              Value *f;
+              if (isHalf) {
+                f = builder.CreateFPExt(builder.CreateBitCast(raw, builder.getHalfTy()), types._float);
+              } else if (isSigned) {
+                f = builder.CreateSIToFP(raw, types._float);
+                if (normalize) { // D3D9 SHORT*N: x / 32767, clamped to -1
+                  f = builder.CreateFDiv(f, ConstantFP::get(types._float, 32767.0));
+                  auto *minus1 = ConstantFP::get(types._float, -1.0);
+                  f = builder.CreateSelect(builder.CreateFCmpOLT(f, minus1), minus1, f);
+                }
+              } else {
+                f = builder.CreateUIToFP(raw, types._float);
+                if (normalize)
+                  f = builder.CreateFDiv(f, ConstantFP::get(types._float, 65535.0));
+              }
+              result = builder.CreateInsertElement(result, f, builder.getInt32(c));
+            }
             break;
           }
           default: {
@@ -883,6 +952,13 @@ static void compileVertexShader(
     auto *isNotNaN = builder.CreateFCmpORD(val, val);
     auto *zeroVec = ConstantVector::getSplat(ElementCount::getFixed(4), ConstantFP::get(types._float, 0.0));
     val = builder.CreateSelect(isNotNaN, val, zeroVec);
+    // SM < 3: D3D9 clamps oD0/oD1 (slots 2-3) and oFog (slot 1) to [0,1] before interpolation. Unclamped,
+    // accumulated lighting > 1 made textured RW-skinned peds overbright/pale in GTA SA.
+    if (sm2VS && (reg == 1 || reg == 2 || reg == 3)) {
+      auto *oneVec = ConstantVector::getSplat(ElementCount::getFixed(4), ConstantFP::get(types._float, 1.0));
+      val = builder.CreateSelect(builder.CreateFCmpOLT(val, zeroVec), zeroVec, val);
+      val = builder.CreateSelect(builder.CreateFCmpOGT(val, oneVec), oneVec, val);
+    }
     retVal = builder.CreateInsertValue(retVal, val, {idx});
   }
 
@@ -1027,7 +1103,7 @@ static void compilePixelShader(
       .raster_order_group = {},
     });
     uint32_t sampIdx = func_sig.DefineInput(ArgumentBindingSampler{
-      .location_index = 20 + sdcl.reg * 2,
+      .location_index = sdcl.reg, // Metal sampler slots are 0..15 (separate namespace)
       .array_size = 1,
       .arg_name = "samp" + std::to_string(sdcl.reg),
     });
@@ -1486,7 +1562,7 @@ static void compilePixelShader(
           int32_t offsets[3] = {0, 0, 0};
           auto [sampled, residency] = air.CreateSample(
             binding.texDesc, texHandle, sampHandle, coord2d, nullptr, offsets,
-            llvm::air::sample_level{air.getFloat(0)});
+            llvm::air::sample_bias{air.getFloat(0)}); // implicit LOD (mipmaps), like D3D9
 
           // Store sampled result to temp register (t# registers are temps after tex)
           builder.CreateStore(sampled, builder.CreateGEP(
@@ -1512,7 +1588,7 @@ static void compilePixelShader(
           int32_t offsets[3] = {0, 0, 0};
           auto [sampled, residency] = air.CreateSample(
             binding.texDesc, texHandle, sampHandle, coord2d, nullptr, offsets,
-            llvm::air::sample_level{air.getFloat(0)});
+            llvm::air::sample_bias{air.getFloat(0)}); // implicit LOD (mipmaps), like D3D9
           storeDst(psInst.dst, sampled);
         }
       }

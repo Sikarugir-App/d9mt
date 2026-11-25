@@ -411,6 +411,9 @@ struct D3D9_FF_PS_STAGE {
   uint8_t alpha_op, alpha_arg1, alpha_arg2;
   uint8_t has_texture;
   uint8_t texcoord_index;
+  uint8_t color_arg0, alpha_arg0; /* third argument of MULTIPLYADD / LERP */
+  uint8_t result_arg;             /* D3DTA_CURRENT or D3DTA_TEMP */
+  uint8_t pad;
 };
 
 struct D3D9_FF_PS_KEY {
@@ -419,6 +422,7 @@ struct D3D9_FF_PS_KEY {
   uint8_t specular_enable;
   uint8_t alpha_test_enable, alpha_test_func;
   uint8_t fog_enable;
+  uint8_t fog_coord_mode; /* 0 = FOG0 is the factor; 1=EXP 2=EXP2 3=LINEAR applied to FOG0 as a coordinate */
 };
 
 AIRCONV_API int D3D9FFCompileVS(

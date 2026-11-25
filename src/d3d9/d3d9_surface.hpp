@@ -44,6 +44,8 @@ public:
   Rc<Texture> &texture() { return texture_; }
   TextureViewKey viewKey() const { return viewKey_; }
   WMTPixelFormat mtlFormat() const { return mtl_format_; }
+  // D3D-visible description for GPU-backed surfaces (depth buffers, RTs)
+  void setD3DDesc(D3DFORMAT format, DWORD usage) { format_ = format; gpu_usage_ = usage; }
   D3DPOOL pool() const { return pool_; }
   void *sysMemData() const { return sys_mem_; }
   UINT pitch() const { return pitch_; }
@@ -57,6 +59,7 @@ private:
   Rc<Texture> texture_;
   TextureViewKey viewKey_ = 0;
   WMTPixelFormat mtl_format_ = WMTPixelFormatInvalid;
+  DWORD gpu_usage_ = D3DUSAGE_RENDERTARGET;
 
   // System memory surface
   D3DPOOL pool_ = D3DPOOL_DEFAULT;

@@ -110,6 +110,7 @@ D3D9Device::D3D9Device(IDirect3D9 *pD3D9, HWND hFocusWindow, D3DPRESENT_PARAMETE
       " msaa=", (int)present_params_.MultiSampleType));
 
   // Configure layer properties for presentation
+  ApplyFullscreenWindow();
   presenter_->changeLayerProperties(
       WMTPixelFormatBGRA8Unorm, WMTColorSpaceSRGB,
       present_params_.BackBufferWidth, present_params_.BackBufferHeight, 1);
@@ -425,17 +426,69 @@ HRESULT STDMETHODCALLTYPE D3D9Device::GetCreationParameters(D3DDEVICE_CREATION_P
   return S_OK;
 }
 
+// Fullscreen D3D9 apps (e.g. RenderWare/GTA SA) expect the device window's client
+// area to match the backbuffer; wined3d and DXGI resize/restyle the window for them.
+void D3D9Device::ApplyFullscreenWindow() {
+  if (present_params_.Windowed || !hwnd_ || !wsi::isWindow(hwnd_))
+    return;
+  HMONITOR monitor = wsi::getWindowMonitor(hwnd_);
+  // Switch the display mode to the backbuffer size first (Wine clamps windows to the screen)
+  wsi::WsiMode mode = {};
+  mode.width = present_params_.BackBufferWidth;
+  mode.height = present_params_.BackBufferHeight;
+  mode.refreshRate = {present_params_.FullScreen_RefreshRateInHz, present_params_.FullScreen_RefreshRateInHz ? 1u : 0u};
+  mode.bitsPerPixel = 32;
+  mode.interlaced = false;
+  bool modeOk = wsi::setWindowMode(monitor, hwnd_, mode);
+  Logger::info(str::format("D3D9Device: display mode ", mode.width, "x", mode.height, modeOk ? " set" : " NOT set"));
+  if (!fullscreen_window_)
+    fullscreen_window_ = wsi::enterFullscreenMode(monitor, hwnd_, &window_state_, false);
+  RECT rect = {};
+  ::GetWindowRect(hwnd_, &rect);
+  ::SetWindowPos(hwnd_, HWND_TOP, rect.left, rect.top,
+                 present_params_.BackBufferWidth, present_params_.BackBufferHeight,
+                 SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+  // A fullscreen device owns the foreground. RenderWare only finishes its startup
+  // (calls Reset and starts rendering) once its window is activated, so don't rely on a click.
+  if (::GetForegroundWindow() != hwnd_) {
+    ::SetForegroundWindow(hwnd_);
+    ::SetActiveWindow(hwnd_);
+    ::SetFocus(hwnd_);
+  }
+  Logger::info(str::format("D3D9Device: foreground=", ::GetForegroundWindow() == hwnd_ ? "yes" : "no"));
+  RECT client = {};
+  ::GetClientRect(hwnd_, &client);
+  Logger::info(str::format("D3D9Device: fullscreen window client ", client.right - client.left, "x",
+                           client.bottom - client.top));
+}
+
 HRESULT STDMETHODCALLTYPE D3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   if (!pPresentationParameters) return D3DERR_INVALIDCALL;
   present_params_ = *pPresentationParameters;
   if (present_params_.BackBufferWidth == 0 || present_params_.BackBufferHeight == 0)
     wsi::getWindowSize(hwnd_, &present_params_.BackBufferWidth, &present_params_.BackBufferHeight);
 
+  ApplyFullscreenWindow();
   presenter_->changeLayerProperties(
       WMTPixelFormatBGRA8Unorm, WMTColorSpaceSRGB,
       present_params_.BackBufferWidth, present_params_.BackBufferHeight, 1);
 
   CreateBackbuffer(present_params_.BackBufferWidth, present_params_.BackBufferHeight);
+
+  // Like real D3D9: Reset recreates the automatic depth/stencil surface and binds it
+  // (apps must release their own DEFAULT-pool surfaces before Reset; RenderWare relies on this).
+  if (present_params_.EnableAutoDepthStencil) {
+    IDirect3DSurface9 *depthSurf = nullptr;
+    CreateDepthStencilSurface(
+        present_params_.BackBufferWidth, present_params_.BackBufferHeight,
+        present_params_.AutoDepthStencilFormat,
+        D3DMULTISAMPLE_NONE, 0, TRUE, &depthSurf, nullptr);
+    SetDepthStencilSurface(depthSurf);
+    if (depthSurf)
+      depthSurf->Release();
+  } else {
+    SetDepthStencilSurface(nullptr);
+  }
 
   // Reset current RT to new backbuffer
   current_rt_surface_ = backbuffer_surface_;
@@ -539,14 +592,6 @@ HRESULT STDMETHODCALLTYPE D3D9Device::Clear(
   if (!(Flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)))
     return S_OK;
 
-  if (Count > 0 && pRects) {
-    static bool warned = false;
-    if (!warned) {
-      Logger::warn("D3D9: Clear with sub-rects not implemented, clearing full surface");
-      warned = true;
-    }
-  }
-
   FlushDrawBatch();
 
   bool clearColor = (Flags & D3DCLEAR_TARGET) != 0;
@@ -561,6 +606,60 @@ HRESULT STDMETHODCALLTYPE D3D9Device::Clear(
 
   auto &queue = dxmt_device_->queue();
   auto chunk = queue.CurrentChunk();
+
+  // D3D9 clears only the viewport, intersected with the scissor rect when enabled and with each given rect.
+  // (GTA SA clears colour+depth+stencil of the backbuffer with a 1024x512 viewport mid-frame; clearing the whole
+  // surface there wiped everything drawn so far = one-frame flashes of buildings/ground.)
+  {
+    UINT rtw = current_rt_ ? current_rt_->width() : 0, rth = current_rt_ ? current_rt_->height() : 0;
+    LONG bx0 = (LONG)viewport_.X, by0 = (LONG)viewport_.Y;
+    LONG bx1 = bx0 + (LONG)viewport_.Width, by1 = by0 + (LONG)viewport_.Height;
+    if (render_states_[D3DRS_SCISSORTESTENABLE]) {
+      bx0 = std::max(bx0, scissor_rect_.left);  by0 = std::max(by0, scissor_rect_.top);
+      bx1 = std::min(bx1, scissor_rect_.right); by1 = std::min(by1, scissor_rect_.bottom);
+    }
+    std::vector<RECT> rects;
+    if (Count > 0 && pRects) {
+      for (DWORD i = 0; i < Count; i++) {
+        RECT r = {std::max(bx0, pRects[i].x1), std::max(by0, pRects[i].y1),
+                  std::min(bx1, pRects[i].x2), std::min(by1, pRects[i].y2)};
+        if (r.right > r.left && r.bottom > r.top) rects.push_back(r);
+      }
+    } else if (bx1 > bx0 && by1 > by0) {
+      rects.push_back({bx0, by0, bx1, by1});
+    }
+    if (rects.empty()) return S_OK;
+    auto covers = [&](UINT w, UINT h) {
+      return rects.size() == 1 && rects[0].left <= 0 && rects[0].top <= 0 &&
+             rects[0].right >= (LONG)w && rects[0].bottom >= (LONG)h;
+    };
+    bool colorFull = !clearColor || !current_rt_ || covers(rtw, rth);
+    bool dsFull = !(clearDepth || clearStencil) || covers(depth_stencil_->width(), depth_stencil_->height());
+    if (!colorFull || !dsFull) {
+      unsigned dsFlags = (clearDepth ? 1 : 0) | (clearStencil ? 2 : 0);
+      chunk->emitcc([
+        rects = std::move(rects), r, g, b, a, Z, Stencil, dsFlags,
+        rt = clearColor ? current_rt_ : Rc<Texture>(), rt_view = current_rt_view_,
+        depth = dsFlags ? depth_stencil_ : Rc<Texture>(), depth_view = depth_stencil_view_
+      ](ArgumentEncodingContext &ctx) mutable {
+        auto run = [&](Rc<Texture> &tex, TextureViewKey view, unsigned flags, uint8_t st,
+                       const std::array<float, 4> &value) {
+          LONG w = (LONG)tex->width(view), h = (LONG)tex->height(view);
+          ctx.clear_rt_cmd.begin(tex, view, flags, st);
+          for (auto &rc : rects) {
+            LONG x0 = std::max(rc.left, 0L), y0 = std::max(rc.top, 0L);
+            LONG x1 = std::min(rc.right, w), y1 = std::min(rc.bottom, h);
+            if (x1 > x0 && y1 > y0)
+              ctx.clear_rt_cmd.clear(x0, y0, x1 - x0, y1 - y0, value);
+          }
+          ctx.clear_rt_cmd.end();
+        };
+        if (rt) run(rt, rt_view, 1, 0, {r, g, b, a});
+        if (depth) run(depth, depth_view, dsFlags, (uint8_t)Stencil, {Z, 0, 0, 0});
+      });
+      return S_OK;
+    }
+  }
 
   if (clearColor) {
     chunk->emitcc([
@@ -616,6 +715,7 @@ HRESULT STDMETHODCALLTYPE D3D9Device::SetRenderState(D3DRENDERSTATETYPE State, D
     [[fallthrough]];
   case D3DRS_ALPHAREF:
   case D3DRS_FOGCOLOR: case D3DRS_FOGSTART: case D3DRS_FOGEND: case D3DRS_FOGDENSITY:
+  case D3DRS_TEXTUREFACTOR: // FF PS c[0]; was never re-uploaded (GTA SA car env map used a stale factor)
     ps_const_version_++;
     ff_const_version_++;
     ff_dirty_ |= kFFDirtyFog | kFFDirtyPS;
@@ -783,6 +883,7 @@ HRESULT STDMETHODCALLTYPE D3D9Device::SetTextureStageState(DWORD Stage, D3DTEXTU
   case D3DTSS_COLOROP: case D3DTSS_COLORARG1: case D3DTSS_COLORARG2:
   case D3DTSS_ALPHAOP: case D3DTSS_ALPHAARG1: case D3DTSS_ALPHAARG2:
   case D3DTSS_TEXCOORDINDEX: case D3DTSS_TEXTURETRANSFORMFLAGS:
+  case D3DTSS_COLORARG0: case D3DTSS_ALPHAARG0: case D3DTSS_RESULTARG:
     pso_dirty_ = true;
     break;
   default:
@@ -854,6 +955,12 @@ HRESULT STDMETHODCALLTYPE D3D9Device::CreateTexture(
     // Metal sees R=luminance, G=alpha. Apply .rrrg swizzle.
     WMTTextureSwizzleChannels swizzle = {
       WMTTextureSwizzleRed, WMTTextureSwizzleRed, WMTTextureSwizzleRed, WMTTextureSwizzleGreen
+    };
+    viewKey = texture->createViewWithSwizzle(viewDesc, swizzle);
+  } else if (Format == D3DFMT_X8R8G8B8 || Format == D3DFMT_X1R5G5B5) {
+    // X formats: the unused byte/bit must read as alpha = 1 (Metal returns whatever is stored there).
+    WMTTextureSwizzleChannels swizzle = {
+      WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleOne
     };
     viewKey = texture->createViewWithSwizzle(viewDesc, swizzle);
   } else if (Format == D3DFMT_L8) {
@@ -989,7 +1096,9 @@ HRESULT STDMETHODCALLTYPE D3D9Device::CreateDepthStencilSurface(
       .arraySize = 1,
   });
 
-  *ppSurface = ref(new D3D9Surface(this, texture, viewKey));
+  auto *dsSurface = new D3D9Surface(this, texture, viewKey);
+  dsSurface->setD3DDesc(Format, D3DUSAGE_DEPTHSTENCIL);
+  *ppSurface = ref(dsSurface);
   return S_OK;
 }
 
@@ -1218,7 +1327,10 @@ static WMT::Reference<WMT::Function> CompileDxsoVertexShaderWithLayout(
   // Build SM50_IA_INPUT_ELEMENT array by matching D3D9 vertex elements to DXSO input DCLs
   auto &elements = vdecl->elements();
   std::vector<SM50_IA_INPUT_ELEMENT> ia_elements;
-  uint32_t slot_mask = 0;
+  // The vertex-buffer table is compacted by stream mask. BuildDrawCapture fills it using the
+  // declaration's full mask, so the shader must use the same mask (not only the streams it reads),
+  // otherwise later streams shift by one entry and the GPU reads the wrong buffer / past the table.
+  uint32_t slot_mask = vdecl->slotMask();
 
   for (auto &elem : elements) {
     if (elem.Stream == 0xFF) break;
@@ -1237,7 +1349,6 @@ static WMT::Reference<WMT::Function> CompileDxsoVertexShaderWithLayout(
         ia_elem.step_function = 0;
         ia_elem.step_rate = 1;
         ia_elements.push_back(ia_elem);
-        slot_mask |= (1 << elem.Stream);
         break;
       }
     }
@@ -1252,6 +1363,7 @@ static WMT::Reference<WMT::Function> CompileDxsoVertexShaderWithLayout(
   Sha1HashState keyHash;
   keyHash.update(vs->sha1());
   keyHash.update(ia_elements.data(), ia_elements.size() * sizeof(SM50_IA_INPUT_ELEMENT));
+  keyHash.update(&slot_mask, sizeof(slot_mask));
   auto cacheKey = keyHash.final();
 
   auto &cache = ShaderCache::getInstance(metalVersion);
@@ -1564,13 +1676,6 @@ obj_handle_t D3D9Device::CreatePSO() {
       // Custom PS: bump VS texcoord count to satisfy PS inputs
       if (current_ps_->maxTexcoordCount() > ffkey.tex_coord_count)
         ffkey.tex_coord_count = current_ps_->maxTexcoordCount();
-      // Re-populate TCI/TTF modes now that tex_coord_count is bumped
-      for (uint8_t i = 0; i < ffkey.tex_coord_count && i < 8; i++) {
-        DWORD tci = texture_stage_states_[i][D3DTSS_TEXCOORDINDEX];
-        ffkey.tci_modes[i] = (uint8_t)((tci >> 16) & 0x3);
-        ffkey.tci_coord_indices[i] = (uint8_t)(tci & 0x7);
-        ffkey.ttf_modes[i] = (uint8_t)(texture_stage_states_[i][D3DTSS_TEXTURETRANSFORMFLAGS] & 0x7);
-      }
     } else {
       // FF PS: bump VS texcoord count if any PS stage uses a higher texcoord_index
       auto &ffpskey = getFFPSKey();
@@ -1584,6 +1689,9 @@ obj_handle_t D3D9Device::CreatePSO() {
         }
       }
     }
+    // (Re-)populate TCI/TTF modes for the final tex_coord_count: a bumped count (e.g. GTA SA vehicle env map
+    // on stage 1 with a single UV set) otherwise left stage 1 as passthru of a non-existent coordinate.
+    FillFFVSTexcoordModes(ffkey);
     auto ff_vs = GetOrCreateFFVS(ffkey, current_vdecl_.ptr());
     vs_handle = ff_vs.handle;
     if (!vs_handle) {
@@ -1650,6 +1758,16 @@ obj_handle_t D3D9Device::CreatePSO() {
     if (current_vs_ && ffkey.fog_enable) {
       if (!DXSOGetVSHasFogOutput(current_vs_->handle()))
         ffkey.fog_enable = 0;
+    }
+    // SM < 3 vertex shader + vertex fog (no table fog): D3D9 treats oFog as a fog coordinate and applies the
+    // FOGVERTEXMODE formula (GTA SA's RW skin shader writes (depth-start)/(end-start); used raw as a factor it
+    // fully fogged every ped).
+    ffkey.fog_coord_mode = 0;
+    if (current_vs_ && ffkey.fog_enable && render_states_[D3DRS_FOGTABLEMODE] == D3DFOG_NONE &&
+        render_states_[D3DRS_FOGVERTEXMODE] != D3DFOG_NONE) {
+      uint32_t ver = current_vs_->bytecodeSize() >= 4 ? *(const uint32_t *)current_vs_->bytecode() : 0;
+      if (((ver >> 8) & 0xFF) < 3)
+        ffkey.fog_coord_mode = (uint8_t)render_states_[D3DRS_FOGVERTEXMODE];
     }
     // Compute effective texcoord count: max of vdecl count and PS stage needs.
     // This ensures the PS declares the same TEXCOORD inputs the VS outputs.
@@ -1727,7 +1845,7 @@ obj_handle_t D3D9Device::CreatePSO() {
 
   pipeline_info.rasterization_enabled = true;
   pipeline_info.raster_sample_count = 1;
-  pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+  // Leave input_primitive_topology Unspecified: the same PSO is used for lines/points too.
 
   // Blend state
   if (blendEnable) {
@@ -1874,7 +1992,9 @@ static void EmitCommonRenderSetup(ArgumentEncodingContext &ctx, DrawCapture &cap
                                    uint64_t argbuf_base = 0) {
   if (start_pass) {
     uint64_t alloc_size = argbuf_size_override ? argbuf_size_override : cap.argbuf_size;
-    uint8_t dsv_flags = (cap.depth_enable && cap.depth_tex)
+    // Attach the bound depth buffer even when ZENABLE is off: the PSO is built with its format, the
+    // DSSO disables the test, and later draws in the same batch may enable depth.
+    uint8_t dsv_flags = cap.depth_tex
         ? DepthStencilPlanarFlags(cap.depth_tex->pixelFormat()) : 0;
     auto &pass_info = *ctx.startRenderPass(dsv_flags, 0, 1, alloc_size);
 
@@ -1884,7 +2004,7 @@ static void EmitCommonRenderSetup(ArgumentEncodingContext &ctx, DrawCapture &cap
     color.load_action = WMTLoadActionLoad;
     color.store_action = WMTStoreActionStore;
 
-    if (cap.depth_enable && cap.depth_tex) {
+    if (cap.depth_tex) {
       pass_info.depth.attachment = ctx.access(cap.depth_tex, cap.depth_view, DXMT_ENCODER_RESOURCE_ACESS_READWRITE);
       pass_info.depth.load_action = WMTLoadActionLoad;
       pass_info.depth.store_action = WMTStoreActionStore;
@@ -1998,8 +2118,12 @@ static void EmitCommonRenderSetup(ArgumentEncodingContext &ctx, DrawCapture &cap
   // Write VS/PS constants — skip copy and reuse previous offset when version matches
   constexpr uint64_t PS_CONST_BUF_SIZE = 256 * 4 * sizeof(float);
 
-  bool reuse_vs = prev && cap.vs_const_version == prev->vs_const_version;
-  bool reuse_ps = prev && cap.ps_const_version == prev->ps_const_version;
+  // Reuse only if the previous upload covered every register this draw reads (same constants, but a shader using
+  // more registers than the previous one would otherwise read stale argbuf data).
+  bool reuse_vs = prev && cap.vs_const_version == prev->vs_const_version &&
+                  cap.vs_const_count <= prev->vs_const_count;
+  bool reuse_ps = prev && cap.ps_const_version == prev->ps_const_version &&
+                  cap.ps_const_count <= prev->ps_const_count;
 
   if (!reuse_vs) {
     auto *vs_const_dst = ctx.getMappedArgumentBuffer<char>(argbuf_base + cap.vb_region_size);
@@ -2049,9 +2173,9 @@ static void EmitCommonRenderSetup(ArgumentEncodingContext &ctx, DrawCapture &cap
       auto &setsamp = ctx.encodeRenderCommand<wmtcmd_render_setsamplerstate>();
       setsamp.type = WMTRenderCommandSetFragmentSamplerState;
       setsamp.sampler_state = cap.samplerHandles[tc.stage];
-      setsamp.index = 20 + tc.stage * 2;
+      setsamp.index = tc.stage; // must match shader [[sampler(stage)]]; Metal allows 0..15
     }
-    ctx.makeResident<PipelineStage::Pixel, PipelineKind::Ordinary>(tc.texture, tc.viewKey);
+    ctx.makeResident<PipelineStage::Pixel, PipelineKind::Ordinary>(tc.texture.ptr(), tc.viewKey);
   }
 }
 
@@ -2125,6 +2249,8 @@ void D3D9Device::FlushDrawBatch() {
       argbuf_offset += bd.cap.argbuf_size;
     }
     ctx.endPass();
+    // NOTE: do not clear `draws` here: the captured allocations (dynamic VBs/IBs) must stay alive
+    // until the chunk completes on the GPU; the lambda is destroyed in chunk.reset() after that.
   });
 
   pending_draws_.clear();
@@ -2203,9 +2329,12 @@ static CommandQueue::TransientAllocation GenerateFanIndices(CommandQueue &queue,
   auto alloc = queue.AllocateTransientBuffer(size, 2);
   auto *indices = static_cast<uint16_t*>(alloc.cpu_ptr);
   for (UINT i = 0; i < primCount; i++) {
-    indices[i * 3 + 0] = (uint16_t)(startVertex + 0);
-    indices[i * 3 + 1] = (uint16_t)(startVertex + i + 1);
-    indices[i * 3 + 2] = (uint16_t)(startVertex + i + 2);
+    // Relative indices; the caller passes StartVertex as baseVertex. (Adding startVertex here wrapped
+    // around 16 bits for draws late in a large vertex buffer and produced stray triangles.)
+    (void)startVertex;
+    indices[i * 3 + 0] = 0;
+    indices[i * 3 + 1] = (uint16_t)(i + 1);
+    indices[i * 3 + 2] = (uint16_t)(i + 2);
   }
   return alloc;
 }
@@ -2238,7 +2367,7 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
   constexpr uint64_t VB_ENTRY_SIZE = 16;
   constexpr uint64_t PS_CONST_BUF_SIZE = 256 * 4 * sizeof(float); // PS needs full 256 regs (special regs at 254-255)
   // VS constant count is known from shader — right-size to avoid wasting argbuf
-  uint16_t vs_const_count = current_vs_ ? (uint16_t)std::min(current_vs_->maxConstantReg(), 256u) : 100;
+  uint16_t vs_const_count = current_vs_ ? (uint16_t)std::min(current_vs_->maxConstantReg(), 256u) : (uint16_t)kFFVSConstCount;
   uint64_t vs_const_buf_size = vs_const_count * 4 * sizeof(float);
   uint64_t vb_region_size = num_vb_slots * VB_ENTRY_SIZE;
   uint64_t argbuf_size = vb_region_size + vs_const_buf_size + PS_CONST_BUF_SIZE;
@@ -2298,15 +2427,18 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
   cap.vs_const_count = vs_const_count; // already computed for argbuf sizing
   cap.ps_const_count = current_ps_ ? (uint16_t)std::min(current_ps_->maxConstantReg(), 256u) : 3;
 
+  // A snapshot only holds the registers that were copied into it: a shader switch to one reading more registers
+  // (same constant version) needs a fresh snapshot too.
   bool need_new_snapshot = (cap.vs_const_version != snapshot_vs_version_) ||
-                           (cap.ps_const_version != snapshot_ps_version_);
+                           (cap.ps_const_version != snapshot_ps_version_) ||
+                           cap.vs_const_count > snapshot_vs_count_ || cap.ps_const_count > snapshot_ps_count_;
   if (need_new_snapshot) {
     auto *snap = &snapshot_ring_[snapshot_ring_head_++ % kSnapshotRingSize];
     if (current_vs_) {
       memcpy(snap->vs, vsConstants_, cap.vs_const_count * 4 * sizeof(float));
     } else {
       UpdateFFConstants();
-      memcpy(snap->vs, cached_ff_vs_, 100 * 4 * sizeof(float));
+      memcpy(snap->vs, cached_ff_vs_, sizeof(cached_ff_vs_));
     }
     if (current_ps_) {
       memcpy(snap->ps, psConstants_, cap.ps_const_count * 4 * sizeof(float));
@@ -2333,6 +2465,8 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
     }
     snapshot_vs_version_ = cap.vs_const_version;
     snapshot_ps_version_ = cap.ps_const_version;
+    snapshot_vs_count_ = current_vs_ ? cap.vs_const_count : (uint16_t)kFFVSConstCount;
+    snapshot_ps_count_ = current_ps_ ? cap.ps_const_count : (uint16_t)3;
     current_const_snapshot_ = snap;
   }
   cap.constants = current_const_snapshot_;
@@ -2425,7 +2559,7 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
     for (uint32_t mask = tex_bound_mask_; mask; mask &= mask - 1) {
       uint32_t stage = __builtin_ctz(mask);
       auto *tex = bound_textures_[stage].ptr();
-      shadow_cap_.texCaptures[shadow_cap_.texCaptureCount++] = {tex->texture().ptr(), tex->viewKey(), stage};
+      shadow_cap_.texCaptures[shadow_cap_.texCaptureCount++] = {tex->texture(), tex->viewKey(), stage};
 
       SamplerKey samplerKey;
       memcpy(samplerKey.state, sampler_states_[stage], sizeof(samplerKey.state));
@@ -2450,7 +2584,7 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
           if (reg >= 16) continue;
           if (!bound_textures_[reg]) {
             shadow_cap_.texCaptures[shadow_cap_.texCaptureCount++] = {
-                default_white_tex_.ptr(), default_white_view_, reg};
+                default_white_tex_, default_white_view_, reg};
             shadow_cap_.samplerHandles[reg] = default_sampler_;
           }
         }
@@ -2462,7 +2596,7 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
           break;
         if (!bound_textures_[stage]) {
           shadow_cap_.texCaptures[shadow_cap_.texCaptureCount++] = {
-              default_white_tex_.ptr(), default_white_view_, stage};
+              default_white_tex_, default_white_view_, stage};
           shadow_cap_.samplerHandles[stage] = default_sampler_;
         }
       }
@@ -2472,16 +2606,16 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
     // Compute fingerprint while shadow is freshly built
     uint64_t h = shadow_cap_.texCaptureCount;
     for (uint8_t i = 0; i < shadow_cap_.texCaptureCount; i++) {
-      h ^= reinterpret_cast<uint64_t>(shadow_cap_.texCaptures[i].texture) * 0x9E3779B97F4A7C15ULL;
+      h ^= reinterpret_cast<uint64_t>(shadow_cap_.texCaptures[i].texture.ptr()) * 0x9E3779B97F4A7C15ULL;
       h ^= (uint64_t)shadow_cap_.texCaptures[i].viewKey * 0x517CC1B727220A95ULL;
       h ^= (uint64_t)shadow_cap_.texCaptures[i].stage << 48;
       h ^= (uint64_t)shadow_cap_.samplerHandles[shadow_cap_.texCaptures[i].stage] * 0x6C62272E07BB0142ULL;
     }
     shadow_cap_.tex_sampler_fingerprint = h;
   }
-  // Copy from shadow (cheap memcpy of raw pointers + handles, no Rc<> atomics)
-  memcpy(cap.texCaptures.data(), shadow_cap_.texCaptures.data(),
-         shadow_cap_.texCaptureCount * sizeof(DrawCapture::TexCapture));
+  // Copy from shadow (Rc<Texture> keeps each texture alive until this capture has been encoded/executed)
+  for (uint8_t i = 0; i < shadow_cap_.texCaptureCount; i++)
+    cap.texCaptures[i] = shadow_cap_.texCaptures[i];
   cap.texCaptureCount = shadow_cap_.texCaptureCount;
   memcpy(cap.samplerHandles, shadow_cap_.samplerHandles, sizeof(cap.samplerHandles));
   cap.tex_sampler_fingerprint = shadow_cap_.tex_sampler_fingerprint;
@@ -2495,6 +2629,7 @@ DrawCapture D3D9Device::BuildDrawCapture(WMTPrimitiveType mtlPrimType) {
 #endif
   return cap;
 }
+
 
 // DrawPrimitive
 HRESULT STDMETHODCALLTYPE D3D9Device::DrawPrimitive(
@@ -2524,7 +2659,7 @@ HRESULT STDMETHODCALLTYPE D3D9Device::DrawPrimitive(
     bd.indexType = WMTIndexTypeUInt16;
     bd.ibRawBuffer = fanIB.buffer;
     bd.ibOffset = fanIB.offset;
-    bd.baseVertex = 0;
+    bd.baseVertex = StartVertex;
     QueueBatchedDraw(std::move(bd));
     return S_OK;
   }
@@ -2564,27 +2699,21 @@ HRESULT STDMETHODCALLTYPE D3D9Device::DrawIndexedPrimitive(
     auto *srcData = (const uint8_t *)current_ib_->allocation()->mappedMemory(0)
                     + StartIndex * srcStride;
 
-    std::vector<uint16_t> expandedIndices(indexCount);
-    for (UINT i = 0; i < PrimitiveCount; i++) {
-      uint32_t i0, i1, i2;
-      if (is32) {
-        i0 = ((const uint32_t *)srcData)[0];
-        i1 = ((const uint32_t *)srcData)[i + 1];
-        i2 = ((const uint32_t *)srcData)[i + 2];
-      } else {
-        i0 = ((const uint16_t *)srcData)[0];
-        i1 = ((const uint16_t *)srcData)[i + 1];
-        i2 = ((const uint16_t *)srcData)[i + 2];
-      }
-      expandedIndices[i * 3 + 0] = (uint16_t)i0;
-      expandedIndices[i * 3 + 1] = (uint16_t)i1;
-      expandedIndices[i * 3 + 2] = (uint16_t)i2;
-    }
-
+    // Expand to a triangle list, keeping the source index width (32-bit indices were truncated to 16 bits).
     auto &queue = dxmt_device_->queue();
-    UINT ibSize = indexCount * sizeof(uint16_t);
-    auto fanIB = queue.AllocateTransientBuffer(ibSize, 2);
-    memcpy(fanIB.cpu_ptr, expandedIndices.data(), ibSize);
+    UINT ibSize = indexCount * srcStride;
+    auto fanIB = queue.AllocateTransientBuffer(ibSize, srcStride);
+    for (UINT i = 0; i < PrimitiveCount; i++) {
+      if (is32) {
+        auto *src = (const uint32_t *)srcData;
+        auto *dst = (uint32_t *)fanIB.cpu_ptr;
+        dst[i * 3 + 0] = src[0]; dst[i * 3 + 1] = src[i + 1]; dst[i * 3 + 2] = src[i + 2];
+      } else {
+        auto *src = (const uint16_t *)srcData;
+        auto *dst = (uint16_t *)fanIB.cpu_ptr;
+        dst[i * 3 + 0] = src[0]; dst[i * 3 + 1] = src[i + 1]; dst[i * 3 + 2] = src[i + 2];
+      }
+    }
 
     auto cap = BuildDrawCapture(mtlPrimType);
     if (!cap.pso) return D3DERR_INVALIDCALL;
@@ -2593,7 +2722,7 @@ HRESULT STDMETHODCALLTYPE D3D9Device::DrawIndexedPrimitive(
     bd.cap = std::move(cap);
     bd.type = BatchedDraw::kIndexed;
     bd.indexCount = indexCount;
-    bd.indexType = WMTIndexTypeUInt16;
+    bd.indexType = is32 ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16;
     bd.ibRawBuffer = fanIB.buffer;
     bd.ibOffset = fanIB.offset;
     bd.baseVertex = BaseVertexIndex;
@@ -2738,34 +2867,27 @@ HRESULT STDMETHODCALLTYPE D3D9Device::DrawIndexedPrimitiveUP(
     // Expand fan → triangle list
     bool is32 = (IndexDataFormat == D3DFMT_INDEX32);
     const uint8_t *srcData = (const uint8_t *)pIndexData;
-    UINT ibSize = indexCount * sizeof(uint16_t);
-    transientIB = queue.AllocateTransientBuffer(ibSize, 2);
-    auto *expandedIndices = static_cast<uint16_t*>(transientIB.cpu_ptr);
+    UINT outStride = is32 ? 4 : 2;
+    transientIB = queue.AllocateTransientBuffer(indexCount * outStride, outStride);
     for (UINT i = 0; i < PrimitiveCount; i++) {
-      uint32_t i0, i1, i2;
       if (is32) {
-        i0 = ((const uint32_t *)srcData)[0];
-        i1 = ((const uint32_t *)srcData)[i + 1];
-        i2 = ((const uint32_t *)srcData)[i + 2];
+        auto *src = (const uint32_t *)srcData;
+        auto *dst = static_cast<uint32_t *>(transientIB.cpu_ptr);
+        dst[i * 3 + 0] = src[0]; dst[i * 3 + 1] = src[i + 1]; dst[i * 3 + 2] = src[i + 2];
       } else {
-        i0 = ((const uint16_t *)srcData)[0];
-        i1 = ((const uint16_t *)srcData)[i + 1];
-        i2 = ((const uint16_t *)srcData)[i + 2];
+        auto *src = (const uint16_t *)srcData;
+        auto *dst = static_cast<uint16_t *>(transientIB.cpu_ptr);
+        dst[i * 3 + 0] = src[0]; dst[i * 3 + 1] = src[i + 1]; dst[i * 3 + 2] = src[i + 2];
       }
-      expandedIndices[i * 3 + 0] = (uint16_t)i0;
-      expandedIndices[i * 3 + 1] = (uint16_t)i1;
-      expandedIndices[i * 3 + 2] = (uint16_t)i2;
     }
-    indexStride = 2;
+    indexStride = outStride;
   } else {
     UINT ibDataSize = indexCount * indexStride;
     transientIB = queue.AllocateTransientBuffer(ibDataSize, indexStride);
     memcpy(transientIB.cpu_ptr, pIndexData, ibDataSize);
   }
 
-  WMTIndexType indexType = (PrimitiveType == D3DPT_TRIANGLEFAN)
-      ? WMTIndexTypeUInt16
-      : ((IndexDataFormat == D3DFMT_INDEX32) ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16);
+  WMTIndexType indexType = (IndexDataFormat == D3DFMT_INDEX32) ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16;
 
   // Save and set stream source
   auto savedVB = stream_sources_[0];
@@ -3039,13 +3161,7 @@ FFVSKey D3D9Device::BuildFFVSKey() {
     }
   }
 
-  // TCI generation modes and texture transform flags per texcoord output
-  for (uint8_t i = 0; i < key.tex_coord_count && i < 8; i++) {
-    DWORD tci = texture_stage_states_[i][D3DTSS_TEXCOORDINDEX];
-    key.tci_modes[i] = (uint8_t)((tci >> 16) & 0x3); // 0=passthru, 1=normal, 2=position, 3=reflection
-    key.tci_coord_indices[i] = (uint8_t)(tci & 0x7);
-    key.ttf_modes[i] = (uint8_t)(texture_stage_states_[i][D3DTSS_TEXTURETRANSFORMFLAGS] & 0x7);
-  }
+  FillFFVSTexcoordModes(key);
 
   // Fog mode: prefer vertex fog, fall back to table fog mode
   // (table fog is normally per-pixel, but we approximate per-vertex in the FF VS)
@@ -3084,6 +3200,20 @@ FFVSKey D3D9Device::BuildFFVSKey() {
   return key;
 }
 
+void D3D9Device::FillFFVSTexcoordModes(FFVSKey &key) {
+  // TCI generation modes and texture transform flags per texcoord output (output i = stage i)
+  for (uint8_t i = 0; i < 8; i++) {
+    if (i < key.tex_coord_count) {
+      DWORD tci = texture_stage_states_[i][D3DTSS_TEXCOORDINDEX];
+      key.tci_modes[i] = (uint8_t)((tci >> 16) & 0x3); // 0=passthru, 1=normal, 2=position, 3=reflection
+      key.tci_coord_indices[i] = (uint8_t)(tci & 0x7);
+      key.ttf_modes[i] = (uint8_t)(texture_stage_states_[i][D3DTSS_TEXTURETRANSFORMFLAGS] & 0x7);
+    } else {
+      key.tci_modes[i] = key.tci_coord_indices[i] = key.ttf_modes[i] = 0;
+    }
+  }
+}
+
 FFPSKey D3D9Device::BuildFFPSKey() {
   FFPSKey key = {};
   for (uint32_t i = 0; i < 8; i++) {
@@ -3096,6 +3226,12 @@ FFPSKey D3D9Device::BuildFFPSKey() {
     stage.alpha_arg2 = (uint8_t)texture_stage_states_[i][D3DTSS_ALPHAARG2];
     stage.has_texture = bound_textures_[i] ? 1 : 0;
     stage.texcoord_index = (uint8_t)(texture_stage_states_[i][D3DTSS_TEXCOORDINDEX] & 0x7);
+    // With the FF VS, output TEXCOORD<i> already holds stage i's routed/generated/transformed coordinates
+    // (TEXCOORDINDEX low bits + TCI mode + D3DTS_TEXTUREi), so stage i must sample TEXCOORD<i>.
+    if (!current_vs_) stage.texcoord_index = (uint8_t)i;
+    stage.color_arg0 = (uint8_t)texture_stage_states_[i][D3DTSS_COLORARG0];
+    stage.alpha_arg0 = (uint8_t)texture_stage_states_[i][D3DTSS_ALPHAARG0];
+    stage.result_arg = (uint8_t)texture_stage_states_[i][D3DTSS_RESULTARG];
     if (stage.color_op == D3DTOP_DISABLE) break;
   }
   key.specular_enable = render_states_[D3DRS_SPECULARENABLE] ? 1 : 0;
@@ -3107,19 +3243,24 @@ FFPSKey D3D9Device::BuildFFPSKey() {
 
 WMT::Reference<WMT::Function> D3D9Device::GetOrCreateFFVS(
     const FFVSKey &key, D3D9VertexDeclaration *vdecl) {
-  auto it = ff_vs_cache_.find(key);
-  if (it != ff_vs_cache_.end())
-    return it->second;
-
   auto &elements = vdecl->elements();
   uint32_t slotMask = vdecl->slotMask();
   uint32_t numElements = elements.size() > 0 ? (uint32_t)elements.size() - 1 : 0; // exclude end sentinel
+
+  // Cache key must include the layout: a shader compiled for one layout read the wrong streams/offsets
+  // for another layout with the same FFVSKey (GTA SA: save pickup collapsed to a point, random stray triangles).
+  std::string cacheKey((const char *)&key, sizeof(key));
+  cacheKey.append((const char *)elements.data(), numElements * sizeof(D3DVERTEXELEMENT9));
+  cacheKey.append((const char *)&slotMask, sizeof(slotMask));
+  auto it = ff_vs_cache_.find(cacheKey);
+  if (it != ff_vs_cache_.end())
+    return it->second;
 
   auto func = GenerateFFVertexShader(
     dxmt_device_->device(), key, elements.data(), numElements, slotMask,
     dxmt_device_->metalVersion());
   if (func)
-    ff_vs_cache_.emplace(key, func);
+    ff_vs_cache_.emplace(std::move(cacheKey), func);
   return func;
 }
 
@@ -3212,11 +3353,14 @@ void D3D9Device::UpdateFFConstants() {
 
   if (dirty & kFFDirtyLights) {
     memset(&vs[28], 0, 40 * 4 * sizeof(float));
+    memset(&vs[100], 0, 8 * 4 * sizeof(float));
     uint32_t li = 0;
     for (DWORD i = 0; i < kMaxLights && li < 8; i++) {
       if (!light_enabled_[i]) continue;
       auto &light = lights_[i];
       uint32_t base = 28 + li * 5;
+      vs[100 + li][0] = light.Specular.r; vs[100 + li][1] = light.Specular.g;
+      vs[100 + li][2] = light.Specular.b; vs[100 + li][3] = light.Specular.a;
 
       float px, py, pz;
       TransformPointByMatrix(view, light.Position.x, light.Position.y, light.Position.z, px, py, pz);

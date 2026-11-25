@@ -43,12 +43,18 @@ struct FFPSKey {
     uint8_t alpha_op, alpha_arg1, alpha_arg2;
     uint8_t has_texture;
     uint8_t texcoord_index = 0;
+    uint8_t color_arg0 = 1, alpha_arg0 = 1; // D3DTA_CURRENT
+    uint8_t result_arg = 1;
+    uint8_t pad = 0;
   };
   Stage stages[8] = {};
   uint8_t tex_coord_count = 0;
   uint8_t specular_enable = 0;
   uint8_t alpha_test_enable = 0, alpha_test_func = 0;
   uint8_t fog_enable = 0;
+  // 0: FOG0 is the fog factor (FF VS). 1=EXP, 2=EXP2, 3=LINEAR: FOG0 is a fog *coordinate* written by a
+  // shader-model < 3 vertex shader (oFog) with vertex fog enabled; D3D9 applies this formula to it.
+  uint8_t fog_coord_mode = 0;
 
   bool operator<(const FFPSKey &rhs) const {
     return memcmp(this, &rhs, sizeof(FFPSKey)) < 0;
